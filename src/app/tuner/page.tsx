@@ -5,35 +5,61 @@ import { autoCorrelate, noteFromFreq, A4_DEFAULT } from "@/lib/audio/pitch";
 
 type Status = "idle" | "requesting" | "tuning" | "denied" | "error";
 
+interface DisplayReading {
+  note: string;
+  octave: number;
+  cents: number;
+  freq: number;
+  isInTune: boolean;
+}
+
 export default function TunerPage() {
   const router = useRouter();
   const [status, setStatus] = useState<Status>("idle");
   const statusRef = useRef<Status>("idle");
-  const [freq, setFreq] = useState<number | null>(null);
+  const [reading, setReading] = useState<DisplayReading | null>(null);
   const [a4, setA4] = useState(A4_DEFAULT);
+  const a4Ref = useRef(a4);
+  a4Ref.current = a4;
 
   const audioCtxRef = useRef<AudioContext | null>(null);
   const analyserRef = useRef<AnalyserNode | null>(null);
+  const filterHighRef = useRef<BiquadFilterNode | null>(null);
+  const filterLowRef = useRef<BiquadFilterNode | null>(null);
   const rafRef = useRef<number>(0);
   const streamRef = useRef<MediaStream | null>(null);
-  const freqHistoryRef = useRef<number[]>([]);
 
-  const noteInfo = freq ? noteFromFreq(freq, a4) : null;
-  const cents = noteInfo?.cents ?? 0;
-  const isInTune = noteInfo !== null && Math.abs(cents) < 4 && (freq ?? 0) > 40;
-  const hasSignal = status === "tuning" && freq !== null && noteInfo !== null;
+  // Pitch stability and physical damping refs
+  const freqRingRef = useRef<number[]>([]);
+  const smoothedCentsRef = useRef<number>(0);
+  const currentNoteKeyRef = useRef<string>("");
+  const lastSignalTimeRef = useRef<number>(0);
+  const lastUiUpdateRef = useRef<number>(0);
+  const wasInTuneRef = useRef<boolean>(false);
 
   const stop = useCallback(() => {
-    cancelAnimationFrame(rafRef.current);
+    if (rafRef.current) cancelAnimationFrame(rafRef.current);
     streamRef.current?.getTracks().forEach((t) => t.stop());
     streamRef.current = null;
-    if (audioCtxRef.current && audioCtxRef.current.state !== "closed") audioCtxRef.current.close().catch(() => {});
+
+    filterHighRef.current?.disconnect();
+    filterLowRef.current?.disconnect();
+    filterHighRef.current = null;
+    filterLowRef.current = null;
+
+    if (audioCtxRef.current && audioCtxRef.current.state !== "closed") {
+      audioCtxRef.current.close().catch(() => {});
+    }
     audioCtxRef.current = null;
     analyserRef.current = null;
     statusRef.current = "idle";
     setStatus("idle");
-    setFreq(null);
-    freqHistoryRef.current = [];
+    setReading(null);
+    freqRingRef.current = [];
+    smoothedCentsRef.current = 0;
+    currentNoteKeyRef.current = "";
+    lastSignalTimeRef.current = 0;
+    wasInTuneRef.current = false;
   }, []);
 
   const start = useCallback(async () => {
@@ -42,29 +68,125 @@ export default function TunerPage() {
     setStatus("requesting");
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
-        audio: { echoCancellation: false, autoGainControl: false, noiseSuppression: false },
+        audio: {
+          echoCancellation: false,
+          autoGainControl: false,
+          noiseSuppression: false,
+        },
       });
       streamRef.current = stream;
-      const ctx = new (window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext)();
+
+      const AudioCtxClass =
+        window.AudioContext ||
+        (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
+      const ctx = new AudioCtxClass();
       if (ctx.state === "suspended") await ctx.resume();
       audioCtxRef.current = ctx;
+
+      // Studio-grade audio pre-filtering:
+      // High-pass at 65Hz cuts wind rumble, table bumps, and AC mains noise
+      const highpass = ctx.createBiquadFilter();
+      highpass.type = "highpass";
+      highpass.frequency.value = 65;
+      highpass.Q.value = 0.707;
+      filterHighRef.current = highpass;
+
+      // Low-pass at 1100Hz cuts pick scratch, hiss, and high harmonic confusion
+      const lowpass = ctx.createBiquadFilter();
+      lowpass.type = "lowpass";
+      lowpass.frequency.value = 1100;
+      lowpass.Q.value = 0.707;
+      filterLowRef.current = lowpass;
+
       const analyser = ctx.createAnalyser();
       analyser.fftSize = 2048;
-      ctx.createMediaStreamSource(stream).connect(analyser);
       analyserRef.current = analyser;
+
+      // Connect graph: Mic -> Highpass -> Lowpass -> Analyser
+      const source = ctx.createMediaStreamSource(stream);
+      source.connect(highpass);
+      highpass.connect(lowpass);
+      lowpass.connect(analyser);
+
       const buffer = new Float32Array(analyser.fftSize);
+
       const tick = () => {
         if (!analyserRef.current || !audioCtxRef.current) return;
         analyserRef.current.getFloatTimeDomainData(buffer);
-        const detected = autoCorrelate(buffer, audioCtxRef.current.sampleRate);
-        if (detected) {
-          freqHistoryRef.current.push(detected);
-          if (freqHistoryRef.current.length > 5) freqHistoryRef.current.shift();
-          const sorted = [...freqHistoryRef.current].sort((a, b) => a - b);
-          setFreq(sorted[Math.floor(sorted.length / 2)]);
+
+        const detectedFreq = autoCorrelate(buffer, audioCtxRef.current.sampleRate);
+        const now = Date.now();
+
+        if (detectedFreq) {
+          // Add to short history ring
+          freqRingRef.current.push(detectedFreq);
+          if (freqRingRef.current.length > 5) freqRingRef.current.shift();
+
+          // Multi-frame consensus: compute median
+          const sorted = [...freqRingRef.current].sort((a, b) => a - b);
+          const median = sorted[Math.floor(sorted.length / 2)];
+
+          // Ensure stability: at least 3 samples are close to the median (within 5%)
+          const consistentCount = sorted.filter((f) => Math.abs(f - median) / median < 0.05).length;
+
+          if (consistentCount >= 3) {
+            const noteInfo = noteFromFreq(median, a4Ref.current);
+            if (noteInfo) {
+              const noteKey = `${noteInfo.note}${noteInfo.octave}`;
+
+              // If switching to a new note, jump directly; if on same note, apply EMA damping
+              if (currentNoteKeyRef.current !== noteKey) {
+                currentNoteKeyRef.current = noteKey;
+                smoothedCentsRef.current = noteInfo.cents;
+              } else {
+                // Exponential moving average: smooths out jitter while remaining responsive
+                smoothedCentsRef.current =
+                  smoothedCentsRef.current * 0.82 + noteInfo.cents * 0.18;
+              }
+
+              // Deadband / In-Tune lock: ±3 cents is considered in-tune
+              const inTune = Math.abs(smoothedCentsRef.current) <= 3.5;
+
+              // Soft haptic feedback when achieving in-tune
+              if (inTune && !wasInTuneRef.current) {
+                try {
+                  if (typeof navigator !== "undefined" && navigator.vibrate) {
+                    navigator.vibrate(15);
+                  }
+                } catch {}
+              }
+              wasInTuneRef.current = inTune;
+
+              lastSignalTimeRef.current = now;
+
+              // Throttle UI update to ~35fps for maximum smoothness without render thrashing
+              if (now - lastUiUpdateRef.current >= 28) {
+                lastUiUpdateRef.current = now;
+                setReading({
+                  note: noteInfo.note,
+                  octave: noteInfo.octave,
+                  cents: smoothedCentsRef.current,
+                  freq: median,
+                  isInTune: inTune,
+                });
+              }
+            }
+          }
+        } else {
+          // Silence or below noise floor:
+          // Sustain hold: hold last note for 1.2s before clearing to "Play a string"
+          if (lastSignalTimeRef.current > 0 && now - lastSignalTimeRef.current > 1200) {
+            lastSignalTimeRef.current = 0;
+            currentNoteKeyRef.current = "";
+            freqRingRef.current = [];
+            wasInTuneRef.current = false;
+            setReading(null);
+          }
         }
+
         rafRef.current = requestAnimationFrame(tick);
       };
+
       statusRef.current = "tuning";
       setStatus("tuning");
       tick();
@@ -76,7 +198,7 @@ export default function TunerPage() {
     }
   }, []);
 
-  // Auto-start tuner once on mount, cleanup on unmount
+  // Auto-start tuner on mount, clean up on unmount
   useEffect(() => {
     start();
     return () => {
@@ -84,9 +206,13 @@ export default function TunerPage() {
     };
   }, [start, stop]);
 
-  // dot position: -50 -> 0%, 0 -> 50%, +50 -> 100%
-  const clampedCents = Math.max(-50, Math.min(50, cents));
-  const dotPct = ((clampedCents + 50) / 100) * 100;
+  // Dot position: -50 -> 0%, 0 -> 50%, +50 -> 100%
+  // When in tune, snaps dead-center inside the target ring
+  const rawCents = reading ? reading.cents : 0;
+  const clampedCents = Math.max(-50, Math.min(50, rawCents));
+  const dotPct = reading?.isInTune ? 50 : ((clampedCents + 50) / 100) * 100;
+  const isInTune = reading?.isInTune ?? false;
+  const hasSignal = status === "tuning" && reading !== null;
 
   return (
     <div className="h-full overflow-hidden bg-transparent flex flex-col justify-between select-none">
@@ -129,7 +255,7 @@ export default function TunerPage() {
               className="absolute top-1/2 -translate-y-1/2 -translate-x-1/2 will-change-transform"
               style={{
                 left: `${dotPct}%`,
-                transition: "left 90ms linear",
+                transition: "left 100ms ease-out",
                 paddingLeft: "20px",
                 paddingRight: "20px",
                 marginLeft: "-20px",
@@ -137,7 +263,7 @@ export default function TunerPage() {
               }}
             >
               <div
-                className={`w-[14px] h-[14px] sm:w-[16px] sm:h-[16px] rounded-full shadow-[0_1px_4px_rgba(0,0,0,0.4)] transition-colors duration-150 ${isInTune ? "bg-[#00E676] shadow-[0_0_10px_rgba(0,230,118,0.6)]" : "bg-[#E53935]"}`}
+                className={`w-[14px] h-[14px] sm:w-[16px] sm:h-[16px] rounded-full shadow-[0_1px_4px_rgba(0,0,0,0.4)] transition-colors duration-150 ${isInTune ? "bg-[#00E676] shadow-[0_0_12px_rgba(0,230,118,0.7)]" : "bg-[#E53935]"}`}
               />
             </div>
           )}
@@ -145,10 +271,10 @@ export default function TunerPage() {
 
         {/* Note / cents read — subtle, appears only when signal */}
         <div className="h-[28px] flex items-center justify-center pb-4">
-          {hasSignal && noteInfo ? (
+          {hasSignal && reading ? (
             <span className={`text-[13px] font-medium tracking-[0.2px] ${isInTune ? "text-[#00E676]" : "text-[var(--ink)]"}`}>
-              {noteInfo.note}
-              {noteInfo.octave} · {cents > 0 ? "+" : ""}{cents.toFixed(0)}¢ {isInTune ? "· In tune" : ""}
+              {reading.note}
+              {reading.octave} · {reading.cents > 0 ? "+" : ""}{reading.cents.toFixed(0)}¢ {isInTune ? "· In tune" : ""}
             </span>
           ) : status === "requesting" ? (
             <span className="text-[13px] text-[var(--muted)]">Requesting mic…</span>

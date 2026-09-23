@@ -1,11 +1,11 @@
-// Pitch detection via autocorrelation (AMDF-style) — no deps
-// Based on common autocorrelation tuner algo, clamped to guitar range.
+// Pitch detection via YIN Algorithm (de Cheveigné & Kawahara)
+// Sub-cent precision, robust harmonic detection, and noise rejection for guitar.
 
 export const NOTES = ["C", "C♯", "D", "D♯", "E", "F", "F♯", "G", "G♯", "A", "A♯", "B"];
 export const A4_DEFAULT = 440;
 
 export function noteFromFreq(freq: number, a4 = A4_DEFAULT): { note: string; octave: number; midi: number; cents: number; refFreq: number } | null {
-  if (!freq || freq < 20 || freq > 5000) return null;
+  if (!freq || freq < 50 || freq > 2000) return null;
   const midi = 69 + 12 * Math.log2(freq / a4);
   const rounded = Math.round(midi);
   const refFreq = a4 * Math.pow(2, (rounded - 69) / 12);
@@ -15,73 +15,103 @@ export function noteFromFreq(freq: number, a4 = A4_DEFAULT): { note: string; oct
   return { note, octave, midi: rounded, cents, refFreq };
 }
 
+/**
+ * YIN pitch detection algorithm:
+ * 1. Checks RMS to gate out ambient background noise.
+ * 2. Computes the squared difference function.
+ * 3. Computes cumulative mean normalized difference (CMND).
+ * 4. Applies absolute thresholding (0.12) to pick fundamental over harmonics.
+ * 5. Uses parabolic interpolation for exact sub-sample peak location.
+ */
 export function autoCorrelate(buffer: Float32Array, sampleRate: number): number | null {
-  // check silence / low volume
-  let rms = 0;
-  for (let i = 0; i < buffer.length; i++) rms += buffer[i] * buffer[i];
-  rms = Math.sqrt(rms / buffer.length);
-  if (rms < 0.008) return null;
-
   const SIZE = buffer.length;
-  const MAX_SAMPLES = Math.floor(SIZE / 2);
-  let bestOffset = -1;
-  let bestCorrelation = 0;
-  let foundGood = false;
-  const correlations = new Array(MAX_SAMPLES);
+  // Calculate RMS for noise gating
+  let sumSquares = 0;
+  for (let i = 0; i < SIZE; i++) {
+    sumSquares += buffer[i] * buffer[i];
+  }
+  const rms = Math.sqrt(sumSquares / SIZE);
+  // Rejection threshold: ignore soft room noise, whisper, breathing (< 0.015)
+  if (rms < 0.015) return null;
 
-  for (let offset = 0; offset < MAX_SAMPLES; offset++) {
-    let correlation = 0;
-    for (let i = 0; i < MAX_SAMPLES; i++) {
-      correlation += Math.abs(buffer[i] - buffer[i + offset]);
+  // Search range: Guitar fundamental range from ~60 Hz (Drop D/C) to ~1200 Hz
+  const minPeriod = Math.floor(sampleRate / 1200); // ~36-40 samples
+  const maxPeriod = Math.min(Math.floor(SIZE / 2), Math.floor(sampleRate / 60)); // ~735-800 samples
+
+  const halfSize = Math.floor(SIZE / 2);
+  const yinBuffer = new Float32Array(maxPeriod + 1);
+
+  // Step 1: Squared difference function
+  for (let tau = minPeriod; tau <= maxPeriod; tau++) {
+    let diff = 0;
+    for (let i = 0; i < halfSize; i++) {
+      const delta = buffer[i] - buffer[i + tau];
+      diff += delta * delta;
     }
-    correlation = 1 - correlation / MAX_SAMPLES;
-    correlations[offset] = correlation;
+    yinBuffer[tau] = diff;
   }
 
-  let lastCorrelation = 1;
-  for (let offset = 0; offset < MAX_SAMPLES; offset++) {
-    const correlation = correlations[offset];
-    if (correlation > 0.9 && correlation > lastCorrelation) {
-      foundGood = true;
-      if (correlation > bestCorrelation) {
-        bestCorrelation = correlation;
-        bestOffset = offset;
+  // Step 2: Cumulative mean normalized difference
+  yinBuffer[0] = 1;
+  let runningSum = 0;
+  for (let tau = 1; tau <= maxPeriod; tau++) {
+    runningSum += yinBuffer[tau];
+    if (runningSum > 0) {
+      yinBuffer[tau] = (yinBuffer[tau] * tau) / runningSum;
+    } else {
+      yinBuffer[tau] = 1;
+    }
+  }
+
+  // Step 3: Absolute thresholding
+  // 0.12 threshold ensures strong periodicity (88%+ confidence) and prevents octave doubling
+  const THRESHOLD = 0.12;
+  let tauEstimate = -1;
+
+  for (let tau = minPeriod; tau <= maxPeriod; tau++) {
+    if (yinBuffer[tau] < THRESHOLD) {
+      // Find the local minimum in this trough
+      while (tau + 1 <= maxPeriod && yinBuffer[tau + 1] < yinBuffer[tau]) {
+        tau++;
       }
-    } else if (foundGood) {
-      // we passed the best
+      tauEstimate = tau;
       break;
     }
-    lastCorrelation = correlation;
   }
 
-  if (bestOffset === -1) {
-    // fallback: find max correlation above threshold
-    let maxCor = 0;
-    let maxOff = -1;
-    for (let o = 0; o < MAX_SAMPLES; o++) {
-      if (correlations[o] > maxCor) {
-        maxCor = correlations[o];
-        maxOff = o;
+  // Fallback: If no period under 0.12, pick global minimum only if reasonably periodic (< 0.22)
+  if (tauEstimate === -1) {
+    let minVal = 1;
+    let minTau = -1;
+    for (let tau = minPeriod; tau <= maxPeriod; tau++) {
+      if (yinBuffer[tau] < minVal) {
+        minVal = yinBuffer[tau];
+        minTau = tau;
       }
     }
-    if (maxCor > 0.3 && maxOff > 0) bestOffset = maxOff;
+    if (minTau !== -1 && minVal < 0.22) {
+      tauEstimate = minTau;
+    }
   }
 
-  if (bestOffset === -1 || bestOffset === 0) return null;
+  if (tauEstimate === -1) return null;
 
-  // refine with parabolic interpolation
-  let shift = 0;
-  if (bestOffset > 0 && bestOffset < MAX_SAMPLES - 1) {
-    const c0 = correlations[bestOffset - 1];
-    const c1 = correlations[bestOffset];
-    const c2 = correlations[bestOffset + 1];
-    const denom = c0 + c2 - 2 * c1;
-    if (denom !== 0) shift = 0.5 * (c0 - c2) / denom;
+  // Step 4: Parabolic interpolation for sub-sample accuracy
+  let betterTau = tauEstimate;
+  if (tauEstimate > minPeriod && tauEstimate < maxPeriod) {
+    const s0 = yinBuffer[tauEstimate - 1];
+    const s1 = yinBuffer[tauEstimate];
+    const s2 = yinBuffer[tauEstimate + 1];
+    const denom = 2 * (s0 - 2 * s1 + s2);
+    if (denom !== 0) {
+      const delta = (s0 - s2) / denom;
+      betterTau = tauEstimate + delta;
+    }
   }
 
-  const freq = sampleRate / (bestOffset + shift);
-  if (freq < 40 || freq > 2000) return null;
-  return freq;
+  const pitch = sampleRate / betterTau;
+  if (pitch < 60 || pitch > 1200) return null;
+  return pitch;
 }
 
 // tunings

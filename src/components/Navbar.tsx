@@ -15,8 +15,8 @@ export default function Navbar() {
   const { theme, toggle } = useTheme();
 
   return (
-    <header className="fixed top-0 inset-x-0 z-50 h-16 border-b border-[var(--hairline)]/40 bg-[var(--canvas)]/45 backdrop-blur-2xl shadow-[0_1px_16px_rgba(20,20,19,0.04)] transition-colors">
-      <div className="mx-auto max-w-[1240px] h-full flex items-center justify-between px-4 sm:px-6">
+    <header className="fixed top-0 inset-x-0 z-50 border-b border-[var(--hairline)]/40 bg-[var(--canvas)]/85 backdrop-blur-2xl shadow-[0_1px_16px_rgba(20,20,19,0.04)] transition-colors pt-[var(--safe-top,0px)]">
+      <div className="mx-auto max-w-[1240px] h-16 flex items-center justify-between px-4 sm:px-6">
         <Link href="/" className="flex items-center gap-2.5 group">
           <span className="flex items-center justify-center w-8 h-8 rounded-full bg-[var(--surface-cream-strong)] dark:bg-white/10 border border-[var(--hairline)] group-hover:border-[var(--primary)]/30 transition-all p-1 shadow-sm overflow-hidden">
             <NoodleLogo size={22} animated="hover-spin" />
